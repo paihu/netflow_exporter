@@ -80,7 +80,7 @@ func (c *netflowCollector) processSamples() {
 	for {
 		select {
 		case sample := <-c.ch:
-			log.Infoln("add samples", sample.Labels)
+			//log.Infoln("add samples", sample.Labels)
 			c.mu.Lock()
 			c.samples[fmt.Sprintf("%s", sample.Labels)] = sample
 			c.mu.Unlock()
@@ -226,11 +226,11 @@ func main() {
 			case *netflow5.Packet:
 				netflow5.Dump(p)
 			case *netflow9.Packet:
-				netflow9.Dump(p)
-				labels := prometheus.Labels{}
-				counts := make(map[string]float64)
+				//netflow9.Dump(p)
 				for _, set := range p.DataFlowSets {
 					for _, record := range set.Records {
+						labels := prometheus.Labels{}
+						counts := make(map[string]float64)
 						for _, field := range record.Fields {
 							if regexp.MustCompile(`Count$`).MatchString(field.Translated.Name) {
 								counts[field.Translated.Name] = float64(field.Translated.Value.(uint64))
@@ -238,19 +238,20 @@ func main() {
 								labels[field.Translated.Name] = fmt.Sprintf("%v", field.Translated.Value)
 							}
 						}
-						sample := netflowSample{
+						sample := &netflowSample{
 							Labels:      labels,
 							Counts:      counts,
 							TimestampMs: timestamp,
 						}
-						log.Infoln("send sample", sample)
-						c.ch <- &sample
+						//log.Infoln("send sample", sample)
+						lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
+						c.ch <- sample
 					}
 				}
 				//for key,value := range counts {
 				//metric :=
 				//}
-				log.Infoln(labels, counts)
+				//log.Infoln(labels, counts)
 			}
 
 		}
@@ -267,5 +268,6 @@ func main() {
 	})
 
 	log.Infoln("Listening on", *listenAddress)
+	log.Infoln("Listening on", *netflowAddress)
 	log.Fatal(http.ListenAndServe(*listenAddress, nil))
 }
