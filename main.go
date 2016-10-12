@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/log"
@@ -24,12 +23,14 @@ import (
 )
 
 var (
-	showVersion    = flag.Bool("version", false, "Print version information.")
-	netflowAddress = flag.String("netflow.listen-address", ":2055", "Network address on which to accept netflow binary network packets, e.g. \":2055\".")
-	listenAddress  = flag.String("web.listen-address", ":9191", "Address on which to expose metrics.")
-	metricsPath    = flag.String("web.telemetry-path", "/metrics", "Path under which to expose Prometheus metrics.")
-	sampleExpiry   = flag.Duration("netflow.sample-expiry", 5*time.Minute, "How long a sample is valid for.")
-	lastProcessed  = prometheus.NewGauge(
+	showVersion     = flag.Bool("version", false, "Print version information.")
+	netflowAddress  = flag.String("netflow.listen-address", ":2055", "Network address on which to accept netflow binary network packets, e.g. \":2055\".")
+	listenAddress   = flag.String("web.listen-address", ":9191", "Address on which to expose metrics.")
+	metricsPath     = flag.String("web.telemetry-path", "/metrics", "Path under which to expose Prometheus metrics.")
+	netflowCollects = flag.String("netflow.collect", "Count$", "Regexp match type is Collect metrics.")
+	netflowExclude  = flag.String("netflow.exclude", "Time", "Regexp match type is not use Label.")
+	sampleExpiry    = flag.Duration("netflow.sample-expiry", 5*time.Minute, "How long a sample is valid for.")
+	lastProcessed   = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "netflow_last_processed_timestamp_seconds",
 			Help: "Unix timestamp of the last processed netflow metric.",
@@ -80,7 +81,6 @@ func (c *netflowCollector) processSamples() {
 	for {
 		select {
 		case sample := <-c.ch:
-			//log.Infoln("add samples", sample.Labels)
 			c.mu.Lock()
 			c.samples[fmt.Sprintf("%s", sample.Labels)] = sample
 			c.mu.Unlock()
@@ -118,22 +118,19 @@ func (c *netflowCollector) Collect(ch chan<- prometheus.Metric) {
 			ch <- MustNewTimeConstMetric(
 				prometheus.NewDesc(fmt.Sprintf("netflow_%s", key), fmt.Sprintf("netflow metric %s", key), []string{}, sample.Labels),
 				prometheus.GaugeValue,
-				value, sample, sample.TimestampMs)
+				value, sample.TimestampMs)
 		}
 	}
 }
 
-func NewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, sample *netflowSample, timestamp int64) (prometheus.Metric, error) {
+func NewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, timestampMs int64) (prometheus.Metric, error) {
 	return &timeConstMetric{
-		timestamp:  timestamp,
-		desc:       desc,
-		valType:    valueType,
-		val:        value,
-		labelPairs: makeLabelPair(sample),
+		timestampMs: timestampMs,
+		metric:      prometheus.MustNewConstMetric(desc, valueType, value, ""),
 	}, nil
 }
-func MustNewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, sample *netflowSample, timestamp int64) prometheus.Metric {
-	m, err := NewTimeConstMetric(desc, valueType, value, sample, timestamp)
+func MustNewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, timestampMs int64) prometheus.Metric {
+	m, err := NewTimeConstMetric(desc, valueType, value, timestampMs)
 	if err != nil {
 		panic(err)
 	}
@@ -142,40 +139,16 @@ func MustNewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueTyp
 }
 
 type timeConstMetric struct {
-	timestamp  int64
-	desc       *prometheus.Desc
-	valType    prometheus.ValueType
-	val        float64
-	labelPairs []*dto.LabelPair
+	timestampMs int64
+	metric      prometheus.Metric
 }
 
-func makeLabelPair(sample *netflowSample) []*dto.LabelPair {
-	labelPairs := make([]*dto.LabelPair, 0)
-	for i, n := range sample.Labels {
-		labelPairs = append(labelPairs, &dto.LabelPair{
-			Name:  proto.String(i),
-			Value: proto.String(n),
-		})
-	}
-	return labelPairs
-}
 func (m *timeConstMetric) Desc() *prometheus.Desc {
-	return m.desc
+	return m.metric.Desc()
 }
 func (m *timeConstMetric) Write(out *dto.Metric) error {
-	out.TimestampMs = &m.timestamp
-	return populateMetric(m.valType, m.val, m.labelPairs, out)
-}
-
-func populateMetric(
-	t prometheus.ValueType,
-	v float64,
-	labelPairs []*dto.LabelPair,
-	m *dto.Metric,
-) error {
-	m.Label = labelPairs
-	m.Gauge = &dto.Gauge{Value: proto.Float64(v)}
-	return nil
+	out.TimestampMs = &m.timestampMs
+	return m.metric.Write(out)
 }
 
 func main() {
@@ -223,17 +196,19 @@ func main() {
 			if err != nil {
 			}
 			switch p := m.(type) {
-			case *netflow5.Packet:
-				netflow5.Dump(p)
+			//case *netflow5.Packet:
+			//netflow5.Dump(p)
 			case *netflow9.Packet:
-				//netflow9.Dump(p)
 				for _, set := range p.DataFlowSets {
 					for _, record := range set.Records {
 						labels := prometheus.Labels{}
 						counts := make(map[string]float64)
 						for _, field := range record.Fields {
-							if regexp.MustCompile(`Count$`).MatchString(field.Translated.Name) {
+							if regexp.MustCompile(*netflowExclude).MatchString(field.Translated.Name) {
+								//log.Infoln(field,"is not using label")
+							} else if regexp.MustCompile(*netflowCollects).MatchString(field.Translated.Name) {
 								counts[field.Translated.Name] = float64(field.Translated.Value.(uint64))
+								//log.Infoln(field,"is using metric")
 							} else {
 								labels[field.Translated.Name] = fmt.Sprintf("%v", field.Translated.Value)
 							}
@@ -243,15 +218,12 @@ func main() {
 							Counts:      counts,
 							TimestampMs: timestamp,
 						}
-						//log.Infoln("send sample", sample)
 						lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
 						c.ch <- sample
 					}
 				}
-				//for key,value := range counts {
-				//metric :=
-				//}
-				//log.Infoln(labels, counts)
+			default:
+				log.Infoln("packet is not supported version")
 			}
 
 		}
@@ -268,6 +240,6 @@ func main() {
 	})
 
 	log.Infoln("Listening on", *listenAddress)
-	log.Infoln("Listening on", *netflowAddress)
+	log.Infoln("Listening UDP on", *netflowAddress)
 	log.Fatal(http.ListenAndServe(*listenAddress, nil))
 }
