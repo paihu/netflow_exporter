@@ -26,7 +26,7 @@ import (
 var (
 	showVersion    = flag.Bool("version", false, "Print version information.")
 	netflowAddress = flag.String("netflow.listen-address", ":2055", "Network address on which to accept netflow binary network packets, e.g. \":2055\".")
-	listenAddress  = flag.String("web.listen-address", ":9200", "Address on which to expose metrics.")
+	listenAddress  = flag.String("web.listen-address", ":9291", "Address on which to expose metrics.")
 	metricsPath    = flag.String("web.telemetry-path", "/metrics", "Path under which to expose Prometheus metrics.")
 	sampleExpiry   = flag.Duration("netflow.sample-expiry", 5*time.Minute, "How long a sample is valid for.")
 	lastProcessed  = prometheus.NewGauge(
