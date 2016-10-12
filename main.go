@@ -109,21 +109,21 @@ func (c *netflowCollector) Collect(ch chan<- prometheus.Metric) {
 		samples = append(samples, sample)
 	}
 	c.mu.Unlock()
-	ageLimit := int64(float64(time.Now().Add(-*sampleExpiry).UnixNano()) / 1e9)
+	ageLimit := int64(float64(time.Now().Add(-*sampleExpiry).UnixNano()) / 1e6)
 	for _, sample := range samples {
 		if ageLimit >= sample.TimestampMs {
 			continue
 		}
 		for key, value := range sample.Counts {
-			ch <- prometheus.MustNewConstMetric(
+			ch <- MustNewTimeConstMetric(
 				prometheus.NewDesc(fmt.Sprintf("netflow_%s", key), fmt.Sprintf("netflow metric %s", key), []string{}, sample.Labels),
 				prometheus.GaugeValue,
-				value)
+				value, sample, sample.TimestampMs)
 		}
 	}
 }
 
-func NewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, sample netflowSample, timestamp int64) (prometheus.Metric, error) {
+func NewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, sample *netflowSample, timestamp int64) (prometheus.Metric, error) {
 	return &timeConstMetric{
 		timestamp:  timestamp,
 		desc:       desc,
@@ -132,7 +132,7 @@ func NewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, v
 		labelPairs: makeLabelPair(sample),
 	}, nil
 }
-func MustNewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, sample netflowSample, timestamp int64) prometheus.Metric {
+func MustNewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, sample *netflowSample, timestamp int64) prometheus.Metric {
 	m, err := NewTimeConstMetric(desc, valueType, value, sample, timestamp)
 	if err != nil {
 		panic(err)
@@ -149,7 +149,7 @@ type timeConstMetric struct {
 	labelPairs []*dto.LabelPair
 }
 
-func makeLabelPair(sample netflowSample) []*dto.LabelPair {
+func makeLabelPair(sample *netflowSample) []*dto.LabelPair {
 	labelPairs := make([]*dto.LabelPair, 0)
 	for i, n := range sample.Labels {
 		labelPairs = append(labelPairs, &dto.LabelPair{
@@ -212,7 +212,7 @@ func main() {
 				log.Errorf("Error reading UDP packet from %s: %s", srcAddress, err)
 				continue
 			}
-			timestamp := int64(float64(time.Now().UnixNano()) / 1e9)
+			timestamp := int64(float64(time.Now().UnixNano()) / 1e6)
 			d, found := decoders[srcAddress.String()]
 			if !found {
 				s := session.New()
