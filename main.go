@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"sync"
 	"time"
 
@@ -76,13 +77,31 @@ func (c *netflowCollector) processReader(r io.Reader) {
 	}
 }
 
+func makeEntryName(l map[string]string) string {
+	keys := []string{}
+	for key, _ := range l {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var name string
+	for _, key := range keys {
+		name += key + "=" + l[key]
+	}
+	return name
+}
 func (c *netflowCollector) processSamples() {
 	ticker := time.NewTicker(time.Minute).C
 	for {
 		select {
 		case sample := <-c.ch:
+
 			c.mu.Lock()
-			c.samples[fmt.Sprintf("%s", sample.Labels)] = sample
+
+			_, ok := c.samples[makeEntryName(sample.Labels)]
+
+			if !ok || (c.samples[makeEntryName(sample.Labels)].TimestampMs < sample.TimestampMs) {
+				c.samples[makeEntryName(sample.Labels)] = sample
+			}
 			c.mu.Unlock()
 		case <-ticker:
 			ageLimit := int64(float64(time.Now().Add(-*sampleExpiry).UnixNano()) / 1e9)
@@ -116,20 +135,23 @@ func (c *netflowCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		for key, value := range sample.Counts {
 			ch <- MustNewTimeConstMetric(
-				prometheus.NewDesc(fmt.Sprintf("netflow_%s", key), fmt.Sprintf("netflow metric %s", key), []string{}, sample.Labels),
-				prometheus.GaugeValue,
-				value, sample.TimestampMs)
+				prometheus.NewDesc(fmt.Sprintf("netflow_%s", key),
+					fmt.Sprintf("netflow metric %s", key),
+					[]string{}, sample.Labels),
+				prometheus.GaugeValue, value, sample.TimestampMs)
 		}
 	}
 }
 
-func NewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, timestampMs int64) (prometheus.Metric, error) {
+func NewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType,
+	value float64, timestampMs int64) (prometheus.Metric, error) {
 	return &timeConstMetric{
 		timestampMs: timestampMs,
-		metric:      prometheus.MustNewConstMetric(desc, valueType, value, ""),
+		metric:      prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value, []string{}...),
 	}, nil
 }
-func MustNewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType, value float64, timestampMs int64) prometheus.Metric {
+func MustNewTimeConstMetric(desc *prometheus.Desc, valueType prometheus.ValueType,
+	value float64, timestampMs int64) prometheus.Metric {
 	m, err := NewTimeConstMetric(desc, valueType, value, timestampMs)
 	if err != nil {
 		panic(err)
@@ -175,6 +197,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error lisening to UDP address: %s", err)
 	}
+	log.Infoln("include", *netflowCollects)
+	if len(*netflowExclude) > 0 {
+		log.Infoln("exclude", *netflowExclude)
+	}
 	go func() {
 		defer udpSock.Close()
 		decoders := make(map[string]*netflow.Decoder)
@@ -185,7 +211,7 @@ func main() {
 				log.Errorf("Error reading UDP packet from %s: %s", srcAddress, err)
 				continue
 			}
-			timestamp := int64(float64(time.Now().UnixNano()) / 1e6)
+			timestampMs := int64(float64(time.Now().UnixNano()) / 1e6)
 			d, found := decoders[srcAddress.String()]
 			if !found {
 				s := session.New()
@@ -204,7 +230,7 @@ func main() {
 						labels := prometheus.Labels{}
 						counts := make(map[string]float64)
 						for _, field := range record.Fields {
-							if regexp.MustCompile(*netflowExclude).MatchString(field.Translated.Name) {
+							if len(*netflowExclude) > 0 && regexp.MustCompile(*netflowExclude).MatchString(field.Translated.Name) {
 								//log.Infoln(field,"is not using label")
 							} else if regexp.MustCompile(*netflowCollects).MatchString(field.Translated.Name) {
 								counts[field.Translated.Name] = float64(field.Translated.Value.(uint64))
@@ -212,14 +238,19 @@ func main() {
 							} else {
 								labels[field.Translated.Name] = fmt.Sprintf("%v", field.Translated.Value)
 							}
+
 						}
-						sample := &netflowSample{
-							Labels:      labels,
-							Counts:      counts,
-							TimestampMs: timestamp,
+						if (len(counts) > 0) && (len(labels) > 0) {
+							labels["From"] = srcAddress.IP.String()
+
+							sample := &netflowSample{
+								Labels:      labels,
+								Counts:      counts,
+								TimestampMs: timestampMs,
+							}
+							lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
+							c.ch <- sample
 						}
-						lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
-						c.ch <- sample
 					}
 				}
 			default:
