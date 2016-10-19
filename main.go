@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -69,7 +70,6 @@ func (c *netflowCollector) processReader(r io.Reader) {
 
 	switch p := m.(type) {
 	case *netflow5.Packet:
-		netflow5.Dump(p)
 	case *netflow9.Packet:
 		for key, value := range p.DataFlowSets {
 			log.Infoln("key:", key, "value:", value)
@@ -222,8 +222,36 @@ func main() {
 			if err != nil {
 			}
 			switch p := m.(type) {
-			//case *netflow5.Packet:
-			//netflow5.Dump(p)
+			case *netflow5.Packet:
+
+				for _, record := range p.Records {
+					labels := prometheus.Labels{}
+					counts := make(map[string]float64)
+					labels["sourceIPv4Address"] = record.SrcAddr.String()
+					labels["destinationIPv4Address"] = record.DstAddr.String()
+					labels["sourceTransportPort"] = strconv.FormatUint(uint64(record.SrcPort), 10)
+					labels["destinationTransportPort"] = strconv.FormatUint(uint64(record.DstPort), 10)
+					counts["packetDeltaCount"] = float64(record.Packets)
+					counts["octetDeltaCount"] = float64(record.Bytes)
+					labels["protocolIdentifier"] = strconv.FormatUint(uint64(record.Protocol), 10)
+					labels["tcpControlBits"] = strconv.FormatUint(uint64(record.TCPFlags), 10)
+					labels["bgpSourceAsNumber"] = strconv.FormatUint(uint64(record.SrcAS), 10)
+					labels["bgpDestinationAsNumber"] = strconv.FormatUint(uint64(record.DstAS), 10)
+					labels["sourceIPv4PrefixLength"] = strconv.FormatUint(uint64(record.SrcMask), 10)
+					labels["destinationIPv4PrefixLength"] = strconv.FormatUint(uint64(record.DstMask), 10)
+					if (len(counts) > 0) && (len(labels) > 0) {
+						labels["From"] = srcAddress.IP.String()
+
+						sample := &netflowSample{
+							Labels:      labels,
+							Counts:      counts,
+							TimestampMs: timestampMs,
+						}
+						lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
+						c.ch <- sample
+					}
+				}
+
 			case *netflow9.Packet:
 				for _, set := range p.DataFlowSets {
 					for _, record := range set.Records {
