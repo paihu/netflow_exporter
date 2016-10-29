@@ -14,3 +14,8 @@ go build
 ```
 Visit http://localhost:9191/metrics
 
+## note
+I think that netflow is not metric and analystic message.
+
+Label conbination is too much to collect.
+
