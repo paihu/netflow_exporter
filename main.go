@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"regexp"
 	"sort"
 	"strconv"
+    "strings"
 	"sync"
 	"time"
 
@@ -61,19 +61,93 @@ func newNetflowCollector() *netflowCollector {
 	return c
 }
 
-func (c *netflowCollector) processReader(r io.Reader) {
-	d := netflow.NewDecoder(session.New())
-	m, err := d.Read(r)
-	if err != nil {
-		log.Infoln("netflow Packet Decord Error : %s", err)
-	}
-
-	switch p := m.(type) {
-	case *netflow5.Packet:
-	case *netflow9.Packet:
-		for key, value := range p.DataFlowSets {
-			log.Infoln("key:", key, "value:", value)
+func (c *netflowCollector) processReader(udpSock *net.UDPConn) {
+	defer udpSock.Close()
+	decoders := make(map[string]*netflow.Decoder)
+	for {
+		buf := make([]byte, 65535)
+		chars, srcAddress, err := udpSock.ReadFromUDP(buf)
+		if err != nil {
+			log.Errorf("Error reading UDP packet from %s: %s", srcAddress, err)
+			continue
 		}
+		timestampMs := int64(float64(time.Now().UnixNano()) / 1e6)
+		d, found := decoders[srcAddress.String()]
+		if !found {
+			s := session.New()
+			d = netflow.NewDecoder(s)
+			decoders[srcAddress.String()] = d
+		}
+		m, err := d.Read(bytes.NewBuffer(buf[:chars]))
+		if err != nil {
+		}
+		switch p := m.(type) {
+		case *netflow5.Packet:
+
+			for _, record := range p.Records {
+				labels := prometheus.Labels{}
+				counts := make(map[string]float64)
+				labels["sourceIPv4Address"] = record.SrcAddr.String()
+				labels["destinationIPv4Address"] = record.DstAddr.String()
+				labels["sourceTransportPort"] = strconv.FormatUint(uint64(record.SrcPort), 10)
+				labels["destinationTransportPort"] = strconv.FormatUint(uint64(record.DstPort), 10)
+				counts["packetDeltaCount"] = float64(record.Packets)
+				counts["octetDeltaCount"] = float64(record.Bytes)
+				labels["protocolIdentifier"] = strconv.FormatUint(uint64(record.Protocol), 10)
+				labels["tcpControlBits"] = strconv.FormatUint(uint64(record.TCPFlags), 10)
+				labels["bgpSourceAsNumber"] = strconv.FormatUint(uint64(record.SrcAS), 10)
+				labels["bgpDestinationAsNumber"] = strconv.FormatUint(uint64(record.DstAS), 10)
+				labels["sourceIPv4PrefixLength"] = strconv.FormatUint(uint64(record.SrcMask), 10)
+				labels["destinationIPv4PrefixLength"] = strconv.FormatUint(uint64(record.DstMask), 10)
+				if (len(counts) > 0) && (len(labels) > 0) {
+					labels["From"] = srcAddress.IP.String()
+					labels["NetflowVersion"] = "5"
+
+					sample := &netflowSample{
+						Labels:      labels,
+						Counts:      counts,
+						TimestampMs: timestampMs,
+					}
+					lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
+					c.ch <- sample
+				}
+			}
+
+		case *netflow9.Packet:
+			for _, set := range p.DataFlowSets {
+				for _, record := range set.Records {
+					labels := prometheus.Labels{}
+					counts := make(map[string]float64)
+					for _, field := range record.Fields {
+						if len(*netflowExclude) > 0 && regexp.MustCompile(*netflowExclude).MatchString(field.Translated.Name) {
+							//log.Infoln(field,"is not using label")
+						} else if regexp.MustCompile(*netflowCollects).MatchString(field.Translated.Name) {
+							counts[field.Translated.Name] = float64(field.Translated.Value.(uint64))
+							//log.Infoln(field,"is using metric")
+						} else {
+							labels[field.Translated.Name] = fmt.Sprintf("%v", field.Translated.Value)
+						}
+
+					}
+					if (len(counts) > 0) && (len(labels) > 0) {
+						labels["From"] = srcAddress.IP.String()
+						labels["TemplateID"] = fmt.Sprintf("%d",record.TemplateID)
+						labels["NetflowVersion"] = "9"
+
+						sample := &netflowSample{
+							Labels:      labels,
+							Counts:      counts,
+							TimestampMs: timestampMs,
+						}
+						lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
+						c.ch <- sample
+					}
+				}
+			}
+		default:
+			log.Infoln("packet is not supported version")
+		}
+
 	}
 }
 
@@ -104,7 +178,7 @@ func (c *netflowCollector) processSamples() {
 			}
 			c.mu.Unlock()
 		case <-ticker:
-			ageLimit := int64(float64(time.Now().Add(-*sampleExpiry).UnixNano()) / 1e9)
+			ageLimit := int64(float64(time.Now().Add(-*sampleExpiry).UnixNano()) / 1e6)
 			c.mu.Lock()
 			for k, sample := range c.samples {
 				if ageLimit >= sample.TimestampMs {
@@ -134,8 +208,16 @@ func (c *netflowCollector) Collect(ch chan<- prometheus.Metric) {
 			continue
 		}
 		for key, value := range sample.Counts {
+            desc :=""
+			if sample.Labels["TemplateID"] != "" {
+				desc = fmt.Sprintf("netflow_%s_TemplateID%s_%s", sample.Labels["From"], sample.Labels["TemplateID"], key)
+			} else {
+				desc = fmt.Sprintf("netflow_%s_%s", sample.Labels["From"], key)
+			}
+            desc = strings.Replace(desc,".","",-1)
+            log.Infoln(desc)
 			ch <- MustNewTimeConstMetric(
-				prometheus.NewDesc(fmt.Sprintf("netflow_%s", key),
+				prometheus.NewDesc(desc,
 					fmt.Sprintf("netflow metric %s", key),
 					[]string{}, sample.Labels),
 				prometheus.GaugeValue, value, sample.TimestampMs)
@@ -201,92 +283,7 @@ func main() {
 	if len(*netflowExclude) > 0 {
 		log.Infoln("exclude", *netflowExclude)
 	}
-	go func() {
-		defer udpSock.Close()
-		decoders := make(map[string]*netflow.Decoder)
-		for {
-			buf := make([]byte, 65535)
-			chars, srcAddress, err := udpSock.ReadFromUDP(buf)
-			if err != nil {
-				log.Errorf("Error reading UDP packet from %s: %s", srcAddress, err)
-				continue
-			}
-			timestampMs := int64(float64(time.Now().UnixNano()) / 1e6)
-			d, found := decoders[srcAddress.String()]
-			if !found {
-				s := session.New()
-				d = netflow.NewDecoder(s)
-				decoders[srcAddress.String()] = d
-			}
-			m, err := d.Read(bytes.NewBuffer(buf[:chars]))
-			if err != nil {
-			}
-			switch p := m.(type) {
-			case *netflow5.Packet:
-
-				for _, record := range p.Records {
-					labels := prometheus.Labels{}
-					counts := make(map[string]float64)
-					labels["sourceIPv4Address"] = record.SrcAddr.String()
-					labels["destinationIPv4Address"] = record.DstAddr.String()
-					labels["sourceTransportPort"] = strconv.FormatUint(uint64(record.SrcPort), 10)
-					labels["destinationTransportPort"] = strconv.FormatUint(uint64(record.DstPort), 10)
-					counts["packetDeltaCount"] = float64(record.Packets)
-					counts["octetDeltaCount"] = float64(record.Bytes)
-					labels["protocolIdentifier"] = strconv.FormatUint(uint64(record.Protocol), 10)
-					labels["tcpControlBits"] = strconv.FormatUint(uint64(record.TCPFlags), 10)
-					labels["bgpSourceAsNumber"] = strconv.FormatUint(uint64(record.SrcAS), 10)
-					labels["bgpDestinationAsNumber"] = strconv.FormatUint(uint64(record.DstAS), 10)
-					labels["sourceIPv4PrefixLength"] = strconv.FormatUint(uint64(record.SrcMask), 10)
-					labels["destinationIPv4PrefixLength"] = strconv.FormatUint(uint64(record.DstMask), 10)
-					if (len(counts) > 0) && (len(labels) > 0) {
-						labels["From"] = srcAddress.IP.String()
-
-						sample := &netflowSample{
-							Labels:      labels,
-							Counts:      counts,
-							TimestampMs: timestampMs,
-						}
-						lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
-						c.ch <- sample
-					}
-				}
-
-			case *netflow9.Packet:
-				for _, set := range p.DataFlowSets {
-					for _, record := range set.Records {
-						labels := prometheus.Labels{}
-						counts := make(map[string]float64)
-						for _, field := range record.Fields {
-							if len(*netflowExclude) > 0 && regexp.MustCompile(*netflowExclude).MatchString(field.Translated.Name) {
-								//log.Infoln(field,"is not using label")
-							} else if regexp.MustCompile(*netflowCollects).MatchString(field.Translated.Name) {
-								counts[field.Translated.Name] = float64(field.Translated.Value.(uint64))
-								//log.Infoln(field,"is using metric")
-							} else {
-								labels[field.Translated.Name] = fmt.Sprintf("%v", field.Translated.Value)
-							}
-
-						}
-						if (len(counts) > 0) && (len(labels) > 0) {
-							labels["From"] = srcAddress.IP.String()
-
-							sample := &netflowSample{
-								Labels:      labels,
-								Counts:      counts,
-								TimestampMs: timestampMs,
-							}
-							lastProcessed.Set(float64(time.Now().UnixNano()) / 1e9)
-							c.ch <- sample
-						}
-					}
-				}
-			default:
-				log.Infoln("packet is not supported version")
-			}
-
-		}
-	}()
+	go c.processReader(udpSock)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
